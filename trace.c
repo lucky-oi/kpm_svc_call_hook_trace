@@ -129,33 +129,31 @@ static void pending_remove(int tgid) {
         }
     }
 }
-static int comm_matches_pkg(const char *comm) {
-    if (!sniff_pkg[0]) return 0;
-    int pkglen;
-    for (pkglen = 0; sniff_pkg[pkglen]; pkglen++);
-    for (int i = 0; comm[i]; i++) {
+static int str_contains(const char *haystack, const char *needle) {
+    int nlen;
+    for (nlen = 0; needle[nlen]; nlen++);
+    if (!nlen) return 0;
+    for (int i = 0; haystack[i]; i++) {
         int j;
-        for (j = 0; sniff_pkg[j] && comm[i+j] == sniff_pkg[j]; j++);
-        if (sniff_pkg[j] == '\0') return 1;
+        for (j = 0; needle[j] && haystack[i+j] == needle[j]; j++);
+        if (needle[j] == '\0') return 1;
     }
     return 0;
 }
-static int path_matches_pkg(const char *path) {
+static int comm_matches_pkg(const char *comm) {
     if (!sniff_pkg[0]) return 0;
-    const char *data = path;
-    while ((data = strstr(data, "/data/")) != NULL) {
-        data += 6;
-        if (strncmp(data, "user/", 5) == 0) {
-            data += 5;
-            while (*data >= '0' && *data <= '9') data++;
-            if (*data == '/') data++;
-        } else if (strncmp(data, "data/", 5) == 0) {
-            data += 5;
-        }
-        if (strncmp(data, sniff_pkg, strlen(sniff_pkg)) == 0)
-            return 1;
-    }
+    if (str_contains(comm, sniff_pkg)) return 1;
+    int pkglen;
+    for (pkglen = 0; sniff_pkg[pkglen]; pkglen++);
+    int last = pkglen;
+    while (last > 0 && sniff_pkg[last-1] != '.') last--;
+    if (last < pkglen && pkglen - last <= 16)
+        return str_contains(comm, sniff_pkg + last);
     return 0;
+}
+static int path_matches_pkg(const char *path) {
+    if (!sniff_pkg[0] || !path) return 0;
+    return str_contains(path, sniff_pkg);
 }
 static void try_sniff_lock(int tgid) {
     if (!sniff_pkg[0] || sniff_locked) return;
@@ -323,7 +321,6 @@ static void before_execve(hook_fargs3_t *args, void *udata) {
     TLOG("execve", "path:%.128s", p);
 }
 #if TRACE_HIGH_FREQ
-/*
 /*
 static void before_read(hook_fargs3_t *args, void *udata) {
     (void)udata;
