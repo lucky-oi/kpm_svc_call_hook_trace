@@ -5,7 +5,7 @@
 #include <linux/string.h>
 #include "trace.h"
 KPM_NAME("kpm_trace_svc");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Ayu");
 KPM_DESCRIPTION("SVC Call Hook — pid/pkg sniff + ring buffer + shell-decrypt auto dump");

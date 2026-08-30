@@ -10,7 +10,7 @@ extern int kfunc_def(snprintf)(char *buf, size_t size, const char *fmt, ...);
 #define TARGET_PID_MAX        16
 #define PENDING_MAX           16
 #define RING_ENTRIES          1024
-#define LOG_ENTRY_SIZE        256
+#define LOG_ENTRY_SIZE        768
 
 
 
@@ -30,8 +30,9 @@ extern int kfunc_def(snprintf)(char *buf, size_t size, const char *fmt, ...);
 #define DUMP_REGION_MAX       16               
 #define DUMP_SESSION_MAX      16               
 #define DUMP_PEND_MAX         8                
-#define DUMP_PEND_GRACE       64               
-#define DUMP_PEND_RETRIES     8                
+#define DUMP_PEND_GRACE       64
+#define DUMP_PEND_RETRIES     8
+#define TRACE_BT_MAX          6
 
 
 

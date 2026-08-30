@@ -149,12 +149,56 @@ mmap      pid:12345  tid:12345  comm:com.example.app  addr:0x0 len:0x8000 prot:r
 mprotect  pid:12345  tid:12345  comm:com.example.app  addr:0x7b000000 len:0x10000 prot:r-x pc:0x7b0c4120
 ```
 
-通过 `pc` 定位调用来源（需要进程未退出）：
-```bash
-grep "\.so" /proc/<pid>/maps | awk -v pc=0x7b0c3f04 \
-  'split($1,a,"-"){s=strtonum("0x"a[1]);e=strtonum("0x"a[2]); \
-    if(s<=strtonum(pc)&&strtonum(pc)<=e)printf "%s +0x%x\n",$5,strtonum(pc)-s}'
+通过 `pc` 定位调用来源：日志中的 `lr=`/`bt` 字段已在事件当下自动符号化；若只有裸地址（进程还活着时），用「调用上下文 → 不杀进程的离线地址定位脚本」一节的可移植 `res` 函数解析。
+
+### 调用上下文
+
+已锁定的目标进程会在日志末尾追加 `pc` 和 `lr`，`lr` 附带符号解析（`lr:0x...=libc.so+0x47e68`，格式 `完整路径+偏移`）。`openat`、`mmap/mmap32`、`mprotect`、`ptrace` 另外追加 `sp`、`fp`。**条件 BT 深扫**（fp 链 + 栈扫描，逐帧解析为 `路径+偏移`，最多 6 帧）触发条件：匿名可执行 `mmap`；转可执行 `mprotect`；`ptrace` 敏感请求（TRACEME/ATTACH/DETACH/POKE*/SETREGS*/SEIZE）；`clone` 含 CLONE_VM 且处于 RWX 窗口；`exit`/`kill`/`tkill`/`tgkill` 处于 RWX 窗口或信号为 5/6/9/11/19 或目标为自身；`execve` 非系统路径；`unshare` 恒触发；`openat` 路径命中敏感特征（/proc/self/、frida/magisk/xposed/riru、.so/.dex/.odex/.vdex）；`readlinkat` 指向 /proc/self 时追加 sp/fp。RWX 窗口：mprotect 转 X 或匿名可执行 mmap 后开启（64 个目标事件内有效），使后续 clone/exit/kill 自动升级深扫。解析失败回退为原始 `0x...`；匿名可执行区显示 `anon+0x...`（偏移相对该匿名映射基址）。
+
+```text
+mprotect ... pc:0xe86fae68 lr:0xc2a6d870=/data/app/.../lib/arm/libshell.so+0x2ae68 \
+         sp:0xfff7bb70 fp:0xe0420 bt:/apex/.../bionic/libc.so+0x47e68,libshell.so+0x2ae68,anon+0x234
 ```
+
+`pc` 是 svc 指令的下一条（几乎总在 libc/linker 里）；`lr` 是调用者；`bt` 向上穿过 libc/linker 到达 App 自身代码。
+
+**符号解析机制**：目标事件发生时调用内核导出函数 `find_vma(mm, addr)` 定位所在 VMA，再用 `show_map_vma`（构造假 seq_file 调用，内核自行格式化 maps 行）取得**完整路径与权限**；`偏移 = addr - 该 so 首个映射基址`（沿同路径 VMA 向前回溯）。解析过程不依赖任何内核结构体布局，跨内核版本稳定；`copy_from_kernel_nofault` 兜底保护所有内核读。探测成功打一行 `bt-res ok (show_map_vma): <路径>`；任一符号缺失自动回退纯十六进制输出，不影响其余字段。
+
+候选进程和未锁定进程不执行寄存器扩展、符号解析或栈回溯。ARM64 用 `x29/x30`；ARM32 按执行状态用 `r7/r11` 作 fp、`r14` 作 lr；arm32 无可靠 frame pointer 时 `bt` 主要靠栈扫描补帧。
+
+### 不杀进程的离线地址定位脚本
+
+日志里的 `pc`/`lr`/`bt` 原始十六进制地址，只要 **app 进程还活着**，即可在手机上用 `/proc/<pid>/maps` 离线解析成 `so+偏移`（不需要 KPM 参与，可与日志里的自动解析互相印证）。手机自带的 `sh` 即可运行（不依赖 awk/gawk）：
+
+```bash
+# 用法：在 su 下执行。res <十六进制地址> <pid>
+res() {
+  a=$((${1} & ~1))
+  while read range perms off dev inode rest; do
+    s=$((0x${range%-*}))
+    e=$((0x${range#*-}))
+    if [ "$a" -ge "$s" ] && [ "$a" -lt "$e" ]; then
+      printf "%s +0x%x  (文件偏移 %s)\n" "$rest" $((a - s + 0x$off)) "$off"
+      return 0
+    fi
+  done < /proc/$2/maps
+  echo "$1 未命中任何映射"
+  return 1
+}
+
+# 示例：解析日志里的几个地址（app 未退出时）
+res 0xe4df84c0 7875
+res 0xe4dcd3af 7875
+res 0x96565870 7875
+```
+
+输出形如 `/apex/com.android.runtime/lib/bionic/libc.so +0x463ae`。批量解析一条日志里所有地址：
+
+```bash
+grep "mprotect" trace.log | head -1 | grep -oE "0x[0-9a-f]+" | while read a; do res "$a" 7875; done
+```
+
+注意：`maps` 第 3 列是该映射在文件内的起始偏移，so 内偏移 = `地址 - 映射起始 + 文件偏移`；脚本已包含此换算。app 退出后 `/proc/<pid>/maps` 消失，所以要在采集期间或采集刚结束时解析；arm32 的 Thumb 位（bit0）脚本已自动清除。
 
 ### 进程/线程生命周期
 
@@ -191,12 +235,7 @@ kill    pid:12345  tid:12345  comm:com.example.app  target:12345  sig:9  pc:0x7b
 ptrace  pid:12345  tid:12345  comm:com.example.app  req:TRACEME  target:0  addr:0x0  data:0x0
 ```
 
-通过 `pc` 定位反调试代码：
-```bash
-grep "\.so" /proc/<pid>/maps | awk -v pc=0x7b0c3f04 \
-  'split($1,a,"-"){s=strtonum("0x"a[1]);e=strtonum("0x"a[2]); \
-    if(s<=strtonum(pc)&&strtonum(pc)<=e)printf "%s +0x%x\n",$5,strtonum(pc)-s}'
-```
+通过 `pc` 定位反调试代码：日志中的 `lr=`/`bt` 已自动符号化；裸地址用「调用上下文 → 不杀进程的离线地址定位脚本」一节的 `res` 函数解析。
 
 ### 其他
 
@@ -209,6 +248,78 @@ grep "\.so" /proc/<pid>/maps | awk -v pc=0x7b0c3f04 \
 | tag | 原因 |
 |-----|------|
 | `read` | 高频（eventfd/pipe 每秒数千次），噪音远大于信息量。如需启用，编辑 `trace.c` 去掉 `/* */` 并设置 `TRACE_HIGH_FREQ 1` |
+
+## 日志分析实战
+
+### 一行日志怎么读
+
+```
+[  90.284] AyuTrace|mprotect pid:8358 tid:8358 comm:android.icredit \
+  addr:0x97e9e000 len:921600 prot:r-x pc:0xe8171e68 \
+  lr:0x96565870=/data/user/0/com.android.icredit/.jiagu/libjiagu.so+0xd870 \
+  sp:0xff8cf180 fp:0xe0420 \
+  bt:libjiagu.so+0xc404,libjiagu.so+0x3840c,libc.so+0x2df52,...
+```
+
+| 字段 | 怎么看 | 分析用途 |
+|------|--------|---------|
+| `tag`+参数 | 事件类型与数据 | mprotect 的 `prot:r-x` = 解密完要执行了 |
+| `pc` | svc 下一条指令，几乎总在 libc/linker | 一般不用管 |
+| `lr:0x..=路径+0x..` | **直接调用者**，符号化后即 `so+偏移` | 谁发起的这个 syscall——IDA/Ghidra 里按偏移跳转 |
+| `bt:` | **向上多层调用链**（条件触发，见下） | 穿过 libc/linker 直达壳自身代码的完整路径 |
+| `anon+0x..` | 匿名可执行区内的帧 | 壳解密落地代码，偏移相对映射基址，可与 `ayudump_*` 对照 |
+
+### 标准分析流程（四步法）
+
+**第一步：确认锁定**——日志开头的 `SNIFF CANDIDATE`/`SNIFF LOCKED` 说明目标进程已就位，之后的 `pid:` 才是真正采集的进程。
+
+**第二步：还原加载链**——用 `openat` 的 `path` 和 `mmap32` 的 `fd` 配对：
+
+```
+openat  path:/data/app/.../lib/arm/libjiagu.so          ← 打开壳 so
+mmap32  fd:58 ... ->0x96cfa000                          ← 映射进内存
+```
+
+fd 相同即同一文件；`->` 是映射后的基址，后续 mprotect/dump 的地址都可以和它对照。
+
+**第三步：定位解密执行点**——找 `prot:r-x` 的 mprotect 或 `prot:rwx` 的匿名 mmap：
+
+```
+mprotect addr:0x97e9e000 len:921600 prot:r-x \
+  lr:...libjiagu.so+0xd870  bt:libjiagu.so+0xc404,...
+>>> DUMPED addr:0x97e9e000 len:921600 ... ayudump_1_..._0x97e9e000_....bin
+```
+
+- `lr` 告诉你是壳的哪段代码（`+0xd870`）发起了权限切换；
+- `bt` 给出这段代码被谁调用（`+0xc404` 等）；
+- `DUMPED` 的 bin 文件就是**解密后的代码本体**，拉出来直接拖进 IDA。
+
+**第四步：定位反调试**——`ptrace`（TRACEME/ATTACH）、`kill` 自杀信号、`exit` 等均带深扫（条件触发），`lr`/`bt` 直达壳的反调试代码。
+
+### bt 的触发条件（为什么有的行没有 bt）
+
+深扫只在**高价值低频率**路径触发，其余事件只有 `lr`（也已符号化）：
+
+| 事件 | 触发 bt 的条件 |
+|------|---------------|
+| `mprotect` | prot 含 X（转可执行） |
+| `mmap/mmap32` | 匿名可执行（prot 含 X 且 fd<0） |
+| `ptrace` | TRACEME/ATTACH/DETACH/POKE\*/SETREGS\*/SEIZE |
+| `openat` | 路径含 `/proc/self/`、frida/magisk/xposed/riru、`.so/.dex/.odex/.vdex` |
+| `execve` | 路径以 `/data/` 开头 |
+| `unshare` | 恒触发 |
+| `clone` | CLONE_VM 且处于 RWX 窗口 |
+| `exit`/`kill` 系 | RWX 窗口内，或致命/调试信号，或目标为自身 |
+| 其余（readlinkat 等） | 不深扫，仅 `lr` 符号化 |
+
+**RWX 窗口**：mprotect 转 X 或匿名可执行 mmap 后开启 64 个目标事件，使紧随其后的 clone/exit/kill 自动升级深扫——专抓"解密→起线程→自杀"连招。
+
+### 常见疑问
+
+- **为什么有的 bt 停在系统 so（libc/linker/art）？** 这类 syscall 本来就是系统组件代劳的（如 ART 加载 odex、linker 映射 so），app 帧在更深的 Java/JNI 层，超出 6 帧/4KB 窗口；壳自研代码直接发起的 syscall（解密、权限切换、反调试）bt 必达 app so。
+- **`anon+0x..` 是什么？** 匿名可执行区（壳解密落地的代码段），`0x` 前部分是映射基址，与 `DUMPED` 文件名中的地址一致。
+- **`bt-res ok (show_map_vma): ...` 是什么？** 解析器首次探测成功的一行日志，显示第一条被解析的 vma 路径；没有这行说明解析降级为裸地址（不影响其他功能）。
+- **app 退出后还能解析地址吗？** 日志里的 `lr=`/`bt` 已在事件当下解析完成，随时可查；裸地址（`0x...`）则需进程存活时用上文离线脚本解析。
 
 ## 加固壳行为识别
 
@@ -281,6 +392,7 @@ adb pull /data/local/tmp/ayudump_*.bin .
 |----|--------|------|
 | `TRACE_HIGH_FREQ` | `1` | `0`=关闭 kill/clone/exit hook |
 | `TRACE_COMPAT_HOOKS` | `1`（v1.3.2 起） | arm32 compat hook。目标为 32 位 app（primaryCpuAbi=armeabi-v7a）时必须开启，否则其全部 syscall 走 compat 表、无钩子可挂 |
+| `TRACE_BT_MAX` | `6` | bt 回溯最大帧数（建议 4~8） |
 | `TRACE_UID_THRESHOLD` | `10000u` | 默认只追踪 UID≥10000 的用户 App |
 | `TARGET_PID_MAX` | `16` | 最多同时追踪的进程数 |
 
@@ -296,6 +408,8 @@ adb pull /data/local/tmp/ayudump_*.bin .
 - **compat（32位）hook**：v1.3.2 起默认开启（此前默认关闭）。历史上曾误用 64 位编号注册 compat hook，实际装到 EABI 编号空间里不相关的 syscall 上；现 13 个编号全部按内核树 `unistd32.h` 逐一核实。注意 compat 的 `mmap` 是 5 参数的 `mmap2`，独立 fargs5 处理器避免 ret 偏移错读。鉴别目标进程位数：`adb shell dumpsys package <pkg> | grep primaryCpuAbi`。
 - **多 KPM 共存**：fp_hook 系按"每张 syscall 表槽一条回调链"管理（befores/afters 数组），与 panda-hide 同挂 openat 等可正常共存、依注册顺序链式调用。
 - **v1.4.0 自动 dump**：仅在包名嗅探 + 已锁定目标下触发，每会话最多 16 个文件（去重表 16 条 FIFO，rwx 观察表 8 条 FIFO）；`clear`/`stop` 重置全部 dump 状态。落盘走目标 app 自身 cred，写不进 app 目录时只报错不崩溃。rwx 观察区的 exit 检查依赖 exit hook（`TRACE_HIGH_FREQ=0` 时仅剩 syscall 宽限窗口检查）。
+- **bt 符号解析**：`lr`/`bt` 的 `so名+偏移` 解析基于 VMA 结构偏移运行期探测 + dentry `d_name` 直读（basename；加载后目标首个事件打出 `bt-res ok: ...` 行）；任一探测失败自动回退十六进制。**全部内核内存读经 `copy_from_kernel_nofault` 拷贝 + 16GB 数值窗口粗筛**，不调用任何 kallsyms 解析出的函数指针做校验，垃圾指针只降级不崩溃。栈扫描补帧可能混入栈上陈旧返回地址，属已知噪声。解析兼容 `__randomize_layout`（mm_struct.mmap 不硬编码），跨内核版本可用。若手机异常关机，重启后 `cat /sys/fs/pstore/console-ramoops*` 查看 panic 现场。
+- **task_ext 无故障读取**：pid/tgid 一律经 `copy_from_kernel_nofault`（缺失退 `probe_kernel_read`，再退原始直读）拷贝后校验 magic，task_ext 指针越界/为 NULL 时只跳过该事件（打一次 `task_ext invalid` 行），不会再 panic。实测某 32 位 app 启动期 kill 调用曾因 ext 指针异常触发内核翻译错误关机。
 - **已知边界**：ctl 并发操作极端情形下 pid 列表计数非原子（人工操作频率下可忽略）；TLOG 格式化缓冲为单一静态区，多核高频并发下个别行可能交错。
 
 ### 旧行为存档（4.9 LKM 版本）
@@ -303,4 +417,3 @@ adb pull /data/local/tmp/ayudump_*.bin .
 - **内核版本**：早期 `.ko` 版本基于 Linux 4.9.270 开发测试。
 - **性能**：默认模式直出 dmesg；add 后走 ring buffer。
 - **pc:0x0**：32 位 compat 进程的 PC 可能无法获取，64 位进程正常。
-
