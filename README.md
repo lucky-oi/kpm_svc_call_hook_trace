@@ -254,11 +254,11 @@ ptrace  pid:12345  tid:12345  comm:com.example.app  req:TRACEME  target:0  addr:
 ### 一行日志怎么读
 
 ```
-[  90.284] AyuTrace|mprotect pid:8358 tid:8358 comm:android.icredit \
+[  90.284] AyuTrace|mprotect pid:8358 tid:8358 comm:demo.app \
   addr:0x97e9e000 len:921600 prot:r-x pc:0xe8171e68 \
-  lr:0x96565870=/data/user/0/com.android.icredit/.jiagu/libjiagu.so+0xd870 \
+  lr:0x96565870=/data/user/0/com.demo.app/.stub/libstub.so+0xd870 \
   sp:0xff8cf180 fp:0xe0420 \
-  bt:libjiagu.so+0xc404,libjiagu.so+0x3840c,libc.so+0x2df52,...
+  bt:libstub.so+0xc404,libstub.so+0x3840c,libc.so+0x2df52,...
 ```
 
 | 字段 | 怎么看 | 分析用途 |
@@ -276,7 +276,7 @@ ptrace  pid:12345  tid:12345  comm:com.example.app  req:TRACEME  target:0  addr:
 **第二步：还原加载链**——用 `openat` 的 `path` 和 `mmap32` 的 `fd` 配对：
 
 ```
-openat  path:/data/app/.../lib/arm/libjiagu.so          ← 打开壳 so
+openat  path:/data/app/.../lib/arm/libstub.so          ← 打开壳 so
 mmap32  fd:58 ... ->0x96cfa000                          ← 映射进内存
 ```
 
@@ -286,7 +286,7 @@ fd 相同即同一文件；`->` 是映射后的基址，后续 mprotect/dump 的
 
 ```
 mprotect addr:0x97e9e000 len:921600 prot:r-x \
-  lr:...libjiagu.so+0xd870  bt:libjiagu.so+0xc404,...
+  lr:...libstub.so+0xd870  bt:libstub.so+0xc404,...
 >>> DUMPED addr:0x97e9e000 len:921600 ... ayudump_1_..._0x97e9e000_....bin
 ```
 
